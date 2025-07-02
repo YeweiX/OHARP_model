@@ -58,4 +58,6 @@ install.packages(c("deSolve", "lhs", "sensitivity", "dplyr", "ggplot2", "doParal
 - **Optional Save**: Uncomment `ggsave` to save the heatmap as a PNG file.
 
 ## Contact
-For issues or questions, contact [Your Name] at [Your Email].
+For issues or questions, contact Yewei Xie at yewei.xie@u.duke.nus.edu.
+
+

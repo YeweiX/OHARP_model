@@ -1,0 +1,222 @@
+# Load required library
+library(deSolve)
+
+# --- 1. Define Parameters and Initial Conditions ---
+N <- 5.18e6         # Total resident population (Singapore, 2011)
+Nh <- 37588*0.85         # Hospital population (fixed)
+Nc <- N - Nh        # Community population
+
+# Hospital Initial Conditions
+RCh <- round(0.124 * Nh)
+RIh <- round(0.119 * 0.314 * 0.377 * Nh)
+SIh <- round(0.119 * 0.314 * 0.56 * Nh)
+Sh <- Nh - RCh - RIh - SIh
+Drh <- 0
+Dsh <- 0
+
+# Community Initial Conditions
+RCc <- round(0.257 * Nc)
+RIc <- round(0.001 * Nc)
+SIc <- round(0.01 * Nc)
+Sc <- Nc - RCc - RIc - SIc
+Drc <- 0
+Dsc <- 0
+
+# Cumulative new cases
+C_RIh <- 0
+C_SIh <- 0
+C_RIc <- 0
+C_SIc <- 0
+
+# Initial conditions vector
+y_init <- c(
+  Sh = Sh, RCh = RCh, RIh = RIh, SIh = SIh,
+  Sc = Sc, RCc = RCc, RIc = RIc, SIc = SIc,
+  Drh = Drh, Dsh = Dsh, Drc = Drc, Dsc = Dsc,
+  C_RIh = C_RIh, C_SIh = C_SIh, C_RIc = C_RIc, C_SIc = C_SIc
+)
+
+# Verify the sum of living compartments
+total_living <- sum(y_init[!names(y_init) %in% c("Drh", "Dsh", "Drc", "Dsc", "C_RIh", "C_SIh", "C_RIc", "C_SIc")])
+cat("Sum of living compartments:", total_living, "\n")
+cat("Total population (living):", N, "\n")
+if (abs(total_living - N) > 1e-6) {
+  warning("The sum of LIVING compartments (", total_living, ") does not equal the total population (", N, ").")
+} else {
+  print("Initial conditions are consistent with the total population.")
+}
+
+# Model Parameters
+params <- list(
+  beta_hh = 0.007962, beta_sh_sih = 0.211563886, delta_rch_rih = 0.03395087,
+  mu_sih = 0.00311667, mu_rih = 0.00404500, gamma_sih_sh = 0.11428571,
+  gamma_rch_sh = 0.00589886, gamma_rih_rch = 0.02433334, delta_rch_sih = 0.00084658,
+  beta_sc_sic = 0.00000792, delta_rcc_ric = 0.000085257, delta_rcc_sic = 0.00084658,
+  gamma_sic_sc = 0.14285714, gamma_rcc_sc = 0.01264863, gamma_ric_rcc = 0.02433334,
+  mu_sic = 0.0026, mu_ric = 0.0009, alpha_adm = 0.000316, alpha_dis = 0.235,
+  beta_eh = 0.002685, beta_hc = 0.005325, beta_sc_ac = 0.00145, beta_sc_ec = 0.000294,
+  mu_b =  0.00002518  , mu_m = 0.000002, mu_d = 0.00001353 
+)
+
+# Time points for simulation
+full_sim_years <- 20
+economic_horizon_years <- 10
+t_start <- 0
+t_end <- 365 * full_sim_years
+times <- seq(t_start, t_end, by = 365)
+
+# Helper function to constrain flows
+constrain_flow <- function(flow_rate, population, dt = 1) {
+  max_flow <- population / dt
+  return(min(flow_rate, max_flow))
+}
+
+# --- 2. Define the ODE System ---
+infection_model_ode <- function(t, y, params) {
+  with(as.list(c(y, params)), {
+    # Extract states with non-negativity
+    Sh <- max(0, y["Sh"]); RCh <- max(0, y["RCh"]); RIh <- max(0, y["RIh"]); SIh <- max(0, y["SIh"]);
+    Sc <- max(0, y["Sc"]); RCc <- max(0, y["RCc"]); RIc <- max(0, y["RIc"]); SIc <- max(0, y["SIc"]);
+    Drh <- max(0, y["Drh"]); Dsh <- max(0, y["Dsh"]); Drc <- max(0, y["Drc"]); Dsc <- max(0, y["Dsc"]);
+    C_RIh <- max(0, y["C_RIh"]); C_SIh <- max(0, y["C_SIh"]); C_RIc <- max(0, y["C_RIc"]); C_SIc <- max(0, y["C_SIc"]);
+    
+    # Check for negative values (diagnostic)
+    compartments <- c(Sh, RCh, RIh, SIh, Sc, RCc, RIc, SIc)
+    if (any(compartments < 0)) {
+      cat(sprintf("Negative value detected at t = %.2f: Sh=%.2f, RCh=%.2f, RIh=%.2f, SIh=%.2f, Sc=%.2f, RCc=%.2f, RIc=%.2f, SIc=%.2f\n",
+                  t, Sh, RCh, RIh, SIh, Sc, RCc, RIc, SIc))
+    }
+    
+    # Current population sizes
+    Nh_current <- max(1, Sh + RCh + RIh + SIh)
+    Nc_current <- max(1, Sc + RCc + RIc + SIc)
+    N_total_living <- Nh_current + Nc_current
+    
+    # Hospital flows OUT
+    flow_beta_eh_Sh <- constrain_flow(beta_eh * Sh, Sh)
+    flow_beta_hh_Sh <- constrain_flow(beta_hh * Sh * RCh / Nh_current, Sh)
+    flow_beta_sh_sih_Sh <- constrain_flow(beta_sh_sih * Sh * SIh / Nh_current, Sh)
+    flow_alpha_dis_Sh <- constrain_flow(alpha_dis * Sh, Sh)
+    flow_mu_d_Sh <- constrain_flow(mu_d * Sh, Sh)
+    
+    flow_delta_rch_rih_RCh <- constrain_flow(delta_rch_rih * RCh, RCh)
+    flow_gamma_rch_sh_RCh <- constrain_flow(gamma_rch_sh * RCh, RCh)
+    flow_alpha_dis_RCh <- constrain_flow(alpha_dis * RCh, RCh)
+    flow_delta_rch_sih_RCh <- constrain_flow(delta_rch_sih * RCh, RCh)
+    flow_mu_d_RCh <- constrain_flow(mu_d * RCh, RCh)
+    
+    flow_gamma_rih_rch_RIh <- constrain_flow(gamma_rih_rch * RIh, RIh)
+    flow_mu_rih_RIh <- constrain_flow(mu_rih * RIh, RIh)
+    
+    flow_gamma_sih_sh_SIh <- constrain_flow(gamma_sih_sh * SIh, SIh)
+    flow_mu_sih_SIh <- constrain_flow(mu_sih * SIh, SIh)
+    
+    # Community flows OUT
+    flow_beta_sc_ec_Sc <- constrain_flow(beta_sc_ec * Sc, Sc)
+    flow_beta_sc_ac_Sc <- constrain_flow(beta_sc_ac * Sc * 0.33, Sc)
+    flow_beta_hc_Sc <- constrain_flow(beta_hc * Sc * RCc / Nc_current, Sc)
+    flow_beta_sc_sic_Sc <- constrain_flow(beta_sc_sic * Sc * SIc / Nc_current, Sc)
+    flow_alpha_adm_Sc <- constrain_flow(alpha_adm * Sc, Sc)
+    flow_mu_d_Sc <- constrain_flow(mu_d * Sc, Sc)
+    
+    flow_delta_rcc_ric_RCc <- constrain_flow(delta_rcc_ric * RCc, RCc)
+    flow_delta_rcc_sic_RCc <- constrain_flow(delta_rcc_sic * RCc, RCc)
+    flow_gamma_rcc_sc_RCc <- constrain_flow(gamma_rcc_sc * RCc, RCc)
+    flow_alpha_adm_RCc <- constrain_flow(alpha_adm * RCc, RCc)
+    flow_mu_d_RCc <- constrain_flow(mu_d * RCc, RCc)
+    
+    flow_gamma_ric_rcc_RIc <- constrain_flow(gamma_ric_rcc * RIc, RIc)
+    flow_mu_ric_RIc <- constrain_flow(mu_ric * RIc, RIc)
+    flow_alpha_adm_RIc <- constrain_flow(alpha_adm * RIc, RIc)
+    
+    flow_gamma_sic_sc_SIc <- constrain_flow(gamma_sic_sc * SIc, SIc)
+    flow_mu_sic_SIc <- constrain_flow(mu_sic * SIc, SIc)
+    flow_alpha_adm_SIc <- constrain_flow(alpha_adm * SIc, SIc)
+    
+    # Hospital compartments
+    dSh_dt <- -flow_beta_eh_Sh - flow_beta_hh_Sh - flow_beta_sh_sih_Sh - flow_alpha_dis_Sh - flow_mu_d_Sh +
+      flow_gamma_sih_sh_SIh + flow_gamma_rch_sh_RCh + flow_alpha_adm_Sc
+    dRCh_dt <- -flow_delta_rch_rih_RCh - flow_gamma_rch_sh_RCh - flow_alpha_dis_RCh - flow_delta_rch_sih_RCh - flow_mu_d_RCh +
+      flow_beta_eh_Sh + flow_beta_hh_Sh + flow_gamma_rih_rch_RIh + flow_alpha_adm_RCc
+    dRIh_dt <- -flow_gamma_rih_rch_RIh - flow_mu_rih_RIh + flow_delta_rch_rih_RCh + flow_alpha_adm_RIc
+    dSIh_dt <- -flow_gamma_sih_sh_SIh - flow_mu_sih_SIh + flow_beta_sh_sih_Sh + flow_delta_rch_sih_RCh + flow_alpha_adm_SIc
+    
+    # Community compartments
+    dSc_dt <- -flow_beta_sc_ec_Sc - flow_beta_sc_ac_Sc - flow_beta_hc_Sc - flow_beta_sc_sic_Sc - flow_alpha_adm_Sc - flow_mu_d_Sc +
+      flow_gamma_sic_sc_SIc + flow_gamma_rcc_sc_RCc + flow_alpha_dis_Sh + mu_b * N_total_living + mu_m * N_total_living
+    dRCc_dt <- -flow_delta_rcc_ric_RCc - flow_delta_rcc_sic_RCc - flow_gamma_rcc_sc_RCc - flow_alpha_adm_RCc - flow_mu_d_RCc +
+      flow_beta_sc_ec_Sc + flow_beta_sc_ac_Sc + flow_beta_hc_Sc + flow_gamma_ric_rcc_RIc + flow_alpha_dis_RCh
+    dRIc_dt <- -flow_gamma_ric_rcc_RIc - flow_mu_ric_RIc - flow_alpha_adm_RIc + flow_delta_rcc_ric_RCc
+    dSIc_dt <- -flow_gamma_sic_sc_SIc - flow_mu_sic_SIc - flow_alpha_adm_SIc + flow_beta_sc_sic_Sc + flow_delta_rcc_sic_RCc
+    
+    # Cumulative deaths
+    dDrh_dt <- flow_mu_rih_RIh
+    dDsh_dt <- flow_mu_sih_SIh
+    dDrc_dt <- flow_mu_ric_RIc
+    dDsc_dt <- flow_mu_sic_SIc
+    
+    # Cumulative new cases
+    dC_RIh_dt <- flow_delta_rch_rih_RCh + flow_alpha_adm_RIc
+    dC_SIh_dt <- flow_beta_sh_sih_Sh + flow_delta_rch_sih_RCh + flow_alpha_adm_SIc
+    dC_RIc_dt <- flow_delta_rcc_ric_RCc
+    dC_SIc_dt <- flow_beta_sc_sic_Sc + flow_delta_rcc_sic_RCc
+    
+    # Return derivatives
+    return(list(c(dSh_dt, dRCh_dt, dRIh_dt, dSIh_dt, dSc_dt, dRCc_dt, dRIc_dt, dSIc_dt,
+                  dDrh_dt, dDsh_dt, dDrc_dt, dDsc_dt, dC_RIh_dt, dC_SIh_dt, dC_RIc_dt, dC_SIc_dt)))
+  })
+}
+
+# --- Revised Solver Function ---
+solve_model <- function(y_init, times, params) {
+  tryCatch({
+    # Use 'radau' for stiff systems with tight tolerances
+    ode(y = y_init, times = times, func = infection_model_ode, parms = params,
+        method = "radau", rtol = 1e-10, atol = 1e-12, hmax = 1)
+  }, error = function(e) {
+    warning("radau failed, trying lsoda: ", e$message)
+    ode(y = y_init, times = times, func = infection_model_ode, parms = params,
+        method = "lsoda", rtol = 1e-8, atol = 1e-10, hmax = 1)
+  })
+}
+
+# --- 3. Run the ODE Simulation ---
+cat("Running ODE simulation for", full_sim_years, "years...\n")
+output <- solve_model(y_init, times, params)
+cat("ODE simulation completed.\n")
+
+# Convert output to data frame
+output_df <- as.data.frame(output)
+
+# Check for negative values in results
+for (col in c("Sh", "RCh", "RIh", "SIh", "Sc", "RCc", "RIc", "SIc")) {
+  min_val <- min(output_df[[col]])
+  if (min_val < 0) {
+    cat(sprintf("Warning: Negative value in %s: %.2f\n", col, min_val))
+  }
+}
+
+
+
+# Filter for the economic evaluation period (Years 11 to 20)
+economic_output_df <- output_df %>%
+  filter(time >= 365 * (full_sim_years - economic_horizon_years)) %>%
+  mutate(econ_year = (time - 365 * (full_sim_years - economic_horizon_years)) / 365) # Recalculate year relative to econ horizon start
+
+# Calculate Annual New Cases and Deaths for the economic evaluation period
+annual_cases_deaths_df_input <- economic_output_df %>%
+  filter(econ_year %in% 1:economic_horizon_years) %>% # Keep only end-of-year data within econ horizon
+  mutate(
+    annual_new_rih = C_RIh - lag(C_RIh, default = economic_output_df %>% filter(econ_year == 0) %>% pull(C_RIh)),
+    annual_new_sih = C_SIh - lag(C_SIh, default = economic_output_df %>% filter(econ_year == 0) %>% pull(C_SIh)),
+    annual_new_ric = C_RIc - lag(C_RIc, default = economic_output_df %>% filter(econ_year == 0) %>% pull(C_RIc)),
+    annual_new_sic = C_SIc - lag(C_SIc, default = economic_output_df %>% filter(econ_year == 0) %>% pull(C_SIc)),
+    annual_deaths_rih = Drh - lag(Drh, default = economic_output_df %>% filter(econ_year == 0) %>% pull(Drh)),
+    annual_deaths_sih = Dsh - lag(Dsh, default = economic_output_df %>% filter(econ_year == 0) %>% pull(Dsh)),
+    annual_deaths_drc = Drc - lag(Drc, default = economic_output_df %>% filter(econ_year == 0) %>% pull(Drc)),
+    annual_deaths_dsc = Dsc - lag(Dsc, default = economic_output_df %>% filter(econ_year == 0) %>% pull(Dsc))
+  ) %>%
+  select(year = econ_year, starts_with("annual_")) # Select the final renamed columns
+
+cat("\nBaseline Simulation Results (Annual over", economic_horizon_years, "Years):\n")
+print(annual_cases_deaths_df_input)
